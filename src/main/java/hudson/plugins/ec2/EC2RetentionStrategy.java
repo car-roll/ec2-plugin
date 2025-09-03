@@ -97,12 +97,15 @@ public class EC2RetentionStrategy extends RetentionStrategy<EC2Computer> impleme
     @Override
     public long check(EC2Computer c) {
         if (!checkLock.tryLock()) {
+            LOGGER.warning("EC2RetentionStrategy: check lock not acquired");
             return CHECK_INTERVAL_MINUTES;
         } else {
             try {
                 long currentTime = this.clock.millis();
+                LOGGER.warning("EC2RetentionStrategy: current time: " + currentTime);
 
                 if (currentTime > nextCheckAfter) {
+                    LOGGER.warning("EC2RetentionStrategy: performing internal check");
                     long intervalMins = internalCheck(c);
                     nextCheckAfter = currentTime + TimeUnit.MINUTES.toMillis(intervalMins);
                     return intervalMins;
@@ -120,6 +123,7 @@ public class EC2RetentionStrategy extends RetentionStrategy<EC2Computer> impleme
          * If we've been told never to terminate, or node is null(deleted), no checks to perform
          */
         if (idleTerminationMinutes == 0 || computer.getNode() == null) {
+            LOGGER.warning("EC2RetentionStrategy: no checks to perform");
             return CHECK_INTERVAL_MINUTES;
         }
 
@@ -127,23 +131,43 @@ public class EC2RetentionStrategy extends RetentionStrategy<EC2Computer> impleme
          * If we have equal or less number of agents than the template's minimum instance count, don't perform check.
          */
         SlaveTemplate slaveTemplate = computer.getSlaveTemplate();
+        LOGGER.warning("EC2RetentionStrategy: checking slave template: " + slaveTemplate);
         if (slaveTemplate != null) {
             long numberOfCurrentInstancesForTemplate = MinimumInstanceChecker.countCurrentNumberOfAgents(slaveTemplate);
+            LOGGER.warning("EC2RetentionStrategy: current instances for template: " + numberOfCurrentInstancesForTemplate);
             if (numberOfCurrentInstancesForTemplate > 0
                     && numberOfCurrentInstancesForTemplate <= slaveTemplate.getMinimumNumberOfInstances()) {
+                LOGGER.warning("EC2RetentionStrategy: not terminating instance: " + computer.getName());
                 // Check if we're in an active time-range for keeping minimum number of instances
                 if (MinimumInstanceChecker.minimumInstancesActive(
                         slaveTemplate.getMinimumNumberOfInstancesTimeRangeConfig())) {
+                    LOGGER.warning("EC2RetentionStrategy: minimum instances active");
                     return CHECK_INTERVAL_MINUTES;
                 }
             }
         }
 
+        LOGGER.warning("EC2RetentionStrategy: checking computer: " + computer.getName());
+        LOGGER.warning("DISABLED flag is: " + DISABLED);
+        LOGGER.warning("EC2RetentionStrategy: getting computer info");
+        try {
+            LOGGER.warning("computer state: " + computer.getState());
+            LOGGER.warning("computer is offline: " + computer.isOffline());
+            LOGGER.warning("computer is connecting: " + computer.isConnecting());
+        } catch (InterruptedException e) {
+            LOGGER.log(Level.WARNING, "Interrupted while checking computer state for " + computer.getName(), e);
+            Thread.currentThread().interrupt();
+            return CHECK_INTERVAL_MINUTES;
+        }
+         /*
+         * If the computer is idle, see if we've been idle for too long.
+         */
         if (computer.isIdle() && !DISABLED) {
             final long uptime;
             final Instant launchedAt;
             InstanceState state;
 
+            LOGGER.warning("EC2RetentionStrategy: is idle and not disabled: " + computer.getName());
             try {
                 state = computer.getState(); // Get State before Uptime because getState will refresh the cached EC2
                 // info
@@ -176,7 +200,9 @@ public class EC2RetentionStrategy extends RetentionStrategy<EC2Computer> impleme
             // An instance may also fail running user data scripts and
             // need to be cleaned up.
             if (computer.isOffline()) {
+                LOGGER.warning("EC2RetentionStrategy: is offline: " + computer.getName());
                 if (computer.isConnecting()) {
+                    LOGGER.warning("EC2RetentionStrategy: is connecting: " + computer.getName());
                     LOGGER.log(
                             Level.FINE,
                             "Computer {0} connecting and still offline, will check if the launch timeout has expired",
@@ -188,6 +214,7 @@ public class EC2RetentionStrategy extends RetentionStrategy<EC2Computer> impleme
                     }
                     long launchTimeout = node.getLaunchTimeoutInMillis();
                     if (launchTimeout > 0 && uptime > launchTimeout) {
+                        LOGGER.warning("EC2RetentionStrategy: launch timeout expired: " + computer.getName());
                         // Computer is offline and startup time has expired
                         LOGGER.info("Startup timeout of " + computer.getName() + " after "
                                 + uptime + " milliseconds (timeout: "
@@ -245,6 +272,7 @@ public class EC2RetentionStrategy extends RetentionStrategy<EC2Computer> impleme
                 }
             }
         }
+        LOGGER.warning("exiting internal check");
         return CHECK_INTERVAL_MINUTES;
     }
 
