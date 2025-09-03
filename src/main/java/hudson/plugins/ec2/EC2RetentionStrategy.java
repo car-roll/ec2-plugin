@@ -159,10 +159,8 @@ public class EC2RetentionStrategy extends RetentionStrategy<EC2Computer> impleme
             Thread.currentThread().interrupt();
             return CHECK_INTERVAL_MINUTES;
         }
-         /*
-         * If the computer is idle, see if we've been idle for too long.
-         */
-        if (computer.isIdle() && !DISABLED) {
+
+        if (!DISABLED) {
             final long uptime;
             final Instant launchedAt;
             InstanceState state;
@@ -180,18 +178,65 @@ public class EC2RetentionStrategy extends RetentionStrategy<EC2Computer> impleme
                 return CHECK_INTERVAL_MINUTES;
             }
 
-            // Don't bother checking anything else if the instance is already in the desired state:
-            // * Already Terminated
-            // * We use stop-on-terminate and the instance is currently stopped or stopping
-            if (InstanceState.TERMINATED.equals(state)
-                    || (slaveTemplate != null && slaveTemplate.stopOnTerminate)
-                            && (InstanceState.STOPPED.equals(state) || InstanceState.STOPPING.equals(state))) {
-                if (computer.isOnline()) {
-                    LOGGER.info("External Stop of " + computer.getName() + " detected - disconnecting. instance status"
-                            + state);
-                    computer.disconnect(null);
+            /*
+            * If the computer is idle, see if we've been idle for too long.
+            */
+            if (computer.isIdle()) {
+                // Don't bother checking anything else if the instance is already in the desired state:
+                // * Already Terminated
+                // * We use stop-on-terminate and the instance is currently stopped or stopping
+                if (InstanceState.TERMINATED.equals(state)
+                        || (slaveTemplate != null && slaveTemplate.stopOnTerminate)
+                                && (InstanceState.STOPPED.equals(state) || InstanceState.STOPPING.equals(state))) {
+                    if (computer.isOnline()) {
+                        LOGGER.info("External Stop of " + computer.getName() + " detected - disconnecting. instance status"
+                                + state);
+                        computer.disconnect(null);
+                    }
+                    return CHECK_INTERVAL_MINUTES;
                 }
-                return CHECK_INTERVAL_MINUTES;
+
+                final long idleMilliseconds =
+                        this.clock.millis() - Math.max(computer.getIdleStartMilliseconds(), launchedAt.toEpochMilli());
+
+                if (idleTerminationMinutes > 0) {
+                    // TODO: really think about the right strategy here, see
+                    // JENKINS-23792
+
+                    if (idleMilliseconds > TimeUnit.MINUTES.toMillis(idleTerminationMinutes)
+                            && !itemsInQueueForThisSlave(computer)) {
+
+                        LOGGER.info("Idle timeout of " + computer.getName() + " after "
+                                + TimeUnit.MILLISECONDS.toMinutes(idleMilliseconds) + " idle minutes, instance status"
+                                + state.toString());
+                        EC2AbstractSlave slaveNode = computer.getNode();
+                        if (slaveNode != null) {
+                            slaveNode.idleTimeout();
+                        }
+                    }
+                } else {
+                    final int oneHourSeconds = (int) TimeUnit.SECONDS.convert(1, TimeUnit.HOURS);
+                    // AWS bills by the hour for EC2 Instances, so calculate the remaining seconds left in the "billing
+                    // hour"
+                    // Note: Since October 2017, this isn't true for Linux instances, but the logic hasn't yet been updated
+                    // for this
+                    final int freeSecondsLeft = oneHourSeconds
+                            - (int) (TimeUnit.SECONDS.convert(uptime, TimeUnit.MILLISECONDS) % oneHourSeconds);
+                    // if we have less "free" (aka already paid for) time left than
+                    // our idle time, stop/terminate the instance
+                    // See JENKINS-23821
+                    if (freeSecondsLeft <= TimeUnit.MINUTES.toSeconds(Math.abs(idleTerminationMinutes))
+                            && !itemsInQueueForThisSlave(computer)) {
+                        LOGGER.info("Idle timeout of " + computer.getName() + " after "
+                                + TimeUnit.MILLISECONDS.toMinutes(idleMilliseconds) + " idle minutes, with "
+                                + TimeUnit.SECONDS.toMinutes(freeSecondsLeft)
+                                + " minutes remaining in billing period");
+                        EC2AbstractSlave slaveNode = computer.getNode();
+                        if (slaveNode != null) {
+                            slaveNode.idleTimeout();
+                        }
+                    }
+                }
             }
 
             // on rare occasions, AWS may return fault instance which shows running in AWS console but can not be
@@ -227,48 +272,6 @@ public class EC2RetentionStrategy extends RetentionStrategy<EC2Computer> impleme
                             Level.FINE,
                             "Computer {0} offline but not connecting, will check if it should be terminated because of the idle time configured",
                             computer.getInstanceId());
-                }
-            }
-
-            final long idleMilliseconds =
-                    this.clock.millis() - Math.max(computer.getIdleStartMilliseconds(), launchedAt.toEpochMilli());
-
-            if (idleTerminationMinutes > 0) {
-                // TODO: really think about the right strategy here, see
-                // JENKINS-23792
-
-                if (idleMilliseconds > TimeUnit.MINUTES.toMillis(idleTerminationMinutes)
-                        && !itemsInQueueForThisSlave(computer)) {
-
-                    LOGGER.info("Idle timeout of " + computer.getName() + " after "
-                            + TimeUnit.MILLISECONDS.toMinutes(idleMilliseconds) + " idle minutes, instance status"
-                            + state.toString());
-                    EC2AbstractSlave slaveNode = computer.getNode();
-                    if (slaveNode != null) {
-                        slaveNode.idleTimeout();
-                    }
-                }
-            } else {
-                final int oneHourSeconds = (int) TimeUnit.SECONDS.convert(1, TimeUnit.HOURS);
-                // AWS bills by the hour for EC2 Instances, so calculate the remaining seconds left in the "billing
-                // hour"
-                // Note: Since October 2017, this isn't true for Linux instances, but the logic hasn't yet been updated
-                // for this
-                final int freeSecondsLeft = oneHourSeconds
-                        - (int) (TimeUnit.SECONDS.convert(uptime, TimeUnit.MILLISECONDS) % oneHourSeconds);
-                // if we have less "free" (aka already paid for) time left than
-                // our idle time, stop/terminate the instance
-                // See JENKINS-23821
-                if (freeSecondsLeft <= TimeUnit.MINUTES.toSeconds(Math.abs(idleTerminationMinutes))
-                        && !itemsInQueueForThisSlave(computer)) {
-                    LOGGER.info("Idle timeout of " + computer.getName() + " after "
-                            + TimeUnit.MILLISECONDS.toMinutes(idleMilliseconds) + " idle minutes, with "
-                            + TimeUnit.SECONDS.toMinutes(freeSecondsLeft)
-                            + " minutes remaining in billing period");
-                    EC2AbstractSlave slaveNode = computer.getNode();
-                    if (slaveNode != null) {
-                        slaveNode.idleTimeout();
-                    }
                 }
             }
         }
