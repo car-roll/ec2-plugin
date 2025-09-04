@@ -120,10 +120,10 @@ public class EC2RetentionStrategy extends RetentionStrategy<EC2Computer> impleme
 
     private long internalCheck(EC2Computer computer) {
         /*
-         * If we've been told never to terminate, or node is null(deleted), no checks to perform
+         * If we've been told never to terminate, or node is null(deleted), no checks to perform, or retention strategy disabled
          */
-        if (idleTerminationMinutes == 0 || computer.getNode() == null) {
-            LOGGER.warning("EC2RetentionStrategy: no checks to perform");
+        if (idleTerminationMinutes == 0 || computer.getNode() == null || DISABLED) {
+            LOGGER.warning("skipping EC2 retention check for " + computer.getName());
             return CHECK_INTERVAL_MINUTES;
         }
 
@@ -131,151 +131,151 @@ public class EC2RetentionStrategy extends RetentionStrategy<EC2Computer> impleme
          * If we have equal or less number of agents than the template's minimum instance count, don't perform check.
          */
         SlaveTemplate slaveTemplate = computer.getSlaveTemplate();
-        LOGGER.warning("EC2RetentionStrategy: checking slave template: " + slaveTemplate);
+        LOGGER.warning("Checking EC2 retention strategy for " + computer.getName());
         if (slaveTemplate != null) {
+            LOGGER.warning("found slave template: " + slaveTemplate.ami);
             long numberOfCurrentInstancesForTemplate = MinimumInstanceChecker.countCurrentNumberOfAgents(slaveTemplate);
-            LOGGER.warning("EC2RetentionStrategy: current instances for template: " + numberOfCurrentInstancesForTemplate);
             if (numberOfCurrentInstancesForTemplate > 0
                     && numberOfCurrentInstancesForTemplate <= slaveTemplate.getMinimumNumberOfInstances()) {
-                LOGGER.warning("EC2RetentionStrategy: not terminating instance: " + computer.getName());
                 // Check if we're in an active time-range for keeping minimum number of instances
                 if (MinimumInstanceChecker.minimumInstancesActive(
                         slaveTemplate.getMinimumNumberOfInstancesTimeRangeConfig())) {
-                    LOGGER.warning("EC2RetentionStrategy: minimum instances active");
+                    LOGGER.warning("Minimum instance count is active for " + slaveTemplate.ami);
                     return CHECK_INTERVAL_MINUTES;
                 }
             }
         }
 
-        LOGGER.warning("EC2RetentionStrategy: checking computer: " + computer.getName());
-        LOGGER.warning("DISABLED flag is: " + DISABLED);
-        LOGGER.warning("EC2RetentionStrategy: getting computer info");
+        final long uptime;
+        final Instant launchedAt;
+        InstanceState state;
+
         try {
-            LOGGER.warning("computer state: " + computer.getState());
-            LOGGER.warning("computer is offline: " + computer.isOffline());
-            LOGGER.warning("computer is connecting: " + computer.isConnecting());
-        } catch (InterruptedException e) {
-            LOGGER.log(Level.WARNING, "Interrupted while checking computer state for " + computer.getName(), e);
-            Thread.currentThread().interrupt();
+            state = computer.getState(); // Get State before Uptime because getState will refresh the cached EC2
+            // info
+            uptime = computer.getUptime();
+            launchedAt = computer.getLaunchTime();
+        } catch (SdkException | InterruptedException e) {
+            // We'll just retry next time we test for idleness.
+            LOGGER.fine("Exception while checking host uptime for " + computer.getName()
+                    + ", will retry next check. Exception: " + e);
+            LOGGER.warning("Exception while checking host uptime for " + computer.getName()
+                    + ", will retry next check. Exception: " + e);
             return CHECK_INTERVAL_MINUTES;
         }
 
-        if (!DISABLED) {
-            final long uptime;
-            final Instant launchedAt;
-            InstanceState state;
-
-            LOGGER.warning("EC2RetentionStrategy: is idle and not disabled: " + computer.getName());
-            try {
-                state = computer.getState(); // Get State before Uptime because getState will refresh the cached EC2
-                // info
-                uptime = computer.getUptime();
-                launchedAt = computer.getLaunchTime();
-            } catch (SdkException | InterruptedException e) {
-                // We'll just retry next time we test for idleness.
-                LOGGER.fine("Exception while checking host uptime for " + computer.getName()
-                        + ", will retry next check. Exception: " + e);
+        if (computer.isIdle()) {
+            LOGGER.warning("computer is idle: " + computer.getName());
+            // Don't bother checking anything else if the instance is already in the desired state:
+            // * Already Terminated
+            // * We use stop-on-terminate and the instance is currently stopped or stopping
+            if (InstanceState.TERMINATED.equals(state)
+                    || (slaveTemplate != null && slaveTemplate.stopOnTerminate)
+                            && (InstanceState.STOPPED.equals(state) || InstanceState.STOPPING.equals(state))) {
+                if (computer.isOnline()) {
+                    LOGGER.info("External Stop of " + computer.getName() + " detected - disconnecting. instance status"
+                            + state);
+                    LOGGER.warning("External Stop of " + computer.getName() + " detected - disconnecting. instance status"
+                            + state);
+                    computer.disconnect(null);
+                }
+                LOGGER.warning("finished terminated state");
                 return CHECK_INTERVAL_MINUTES;
             }
 
-            /*
-            * If the computer is idle, see if we've been idle for too long.
-            */
-            if (computer.isIdle()) {
-                // Don't bother checking anything else if the instance is already in the desired state:
-                // * Already Terminated
-                // * We use stop-on-terminate and the instance is currently stopped or stopping
-                if (InstanceState.TERMINATED.equals(state)
-                        || (slaveTemplate != null && slaveTemplate.stopOnTerminate)
-                                && (InstanceState.STOPPED.equals(state) || InstanceState.STOPPING.equals(state))) {
-                    if (computer.isOnline()) {
-                        LOGGER.info("External Stop of " + computer.getName() + " detected - disconnecting. instance status"
-                                + state);
-                        computer.disconnect(null);
-                    }
-                    return CHECK_INTERVAL_MINUTES;
-                }
+            final long idleMilliseconds =
+                    this.clock.millis() - Math.max(computer.getIdleStartMilliseconds(), launchedAt.toEpochMilli());
 
-                final long idleMilliseconds =
-                        this.clock.millis() - Math.max(computer.getIdleStartMilliseconds(), launchedAt.toEpochMilli());
+            if (idleTerminationMinutes > 0) {
+                // TODO: really think about the right strategy here, see
+                // JENKINS-23792
 
-                if (idleTerminationMinutes > 0) {
-                    // TODO: really think about the right strategy here, see
-                    // JENKINS-23792
+                if (idleMilliseconds > TimeUnit.MINUTES.toMillis(idleTerminationMinutes)
+                        && !itemsInQueueForThisSlave(computer)) {
 
-                    if (idleMilliseconds > TimeUnit.MINUTES.toMillis(idleTerminationMinutes)
-                            && !itemsInQueueForThisSlave(computer)) {
-
-                        LOGGER.info("Idle timeout of " + computer.getName() + " after "
-                                + TimeUnit.MILLISECONDS.toMinutes(idleMilliseconds) + " idle minutes, instance status"
-                                + state.toString());
-                        EC2AbstractSlave slaveNode = computer.getNode();
-                        if (slaveNode != null) {
-                            slaveNode.idleTimeout();
-                        }
-                    }
-                } else {
-                    final int oneHourSeconds = (int) TimeUnit.SECONDS.convert(1, TimeUnit.HOURS);
-                    // AWS bills by the hour for EC2 Instances, so calculate the remaining seconds left in the "billing
-                    // hour"
-                    // Note: Since October 2017, this isn't true for Linux instances, but the logic hasn't yet been updated
-                    // for this
-                    final int freeSecondsLeft = oneHourSeconds
-                            - (int) (TimeUnit.SECONDS.convert(uptime, TimeUnit.MILLISECONDS) % oneHourSeconds);
-                    // if we have less "free" (aka already paid for) time left than
-                    // our idle time, stop/terminate the instance
-                    // See JENKINS-23821
-                    if (freeSecondsLeft <= TimeUnit.MINUTES.toSeconds(Math.abs(idleTerminationMinutes))
-                            && !itemsInQueueForThisSlave(computer)) {
-                        LOGGER.info("Idle timeout of " + computer.getName() + " after "
-                                + TimeUnit.MILLISECONDS.toMinutes(idleMilliseconds) + " idle minutes, with "
-                                + TimeUnit.SECONDS.toMinutes(freeSecondsLeft)
-                                + " minutes remaining in billing period");
-                        EC2AbstractSlave slaveNode = computer.getNode();
-                        if (slaveNode != null) {
-                            slaveNode.idleTimeout();
-                        }
+                    LOGGER.info("Idle timeout of " + computer.getName() + " after "
+                            + TimeUnit.MILLISECONDS.toMinutes(idleMilliseconds) + " idle minutes, instance status"
+                            + state.toString());
+                    LOGGER.warning("Idle timeout of " + computer.getName() + " after "
+                            + TimeUnit.MILLISECONDS.toMinutes(idleMilliseconds) + " idle minutes, instance status"
+                            + state.toString());
+                    EC2AbstractSlave slaveNode = computer.getNode();
+                    if (slaveNode != null) {
+                        LOGGER.warning("slave node not null 1");
+                        slaveNode.idleTimeout();
                     }
                 }
-            }
-
-            // on rare occasions, AWS may return fault instance which shows running in AWS console but can not be
-            // connected.
-            // need terminate such fault instance.
-            // An instance may also fail running user data scripts and
-            // need to be cleaned up.
-            if (computer.isOffline()) {
-                LOGGER.warning("EC2RetentionStrategy: is offline: " + computer.getName());
-                if (computer.isConnecting()) {
-                    LOGGER.warning("EC2RetentionStrategy: is connecting: " + computer.getName());
-                    LOGGER.log(
-                            Level.FINE,
-                            "Computer {0} connecting and still offline, will check if the launch timeout has expired",
-                            computer.getInstanceId());
-
-                    EC2AbstractSlave node = computer.getNode();
-                    if (Objects.isNull(node)) {
-                        return CHECK_INTERVAL_MINUTES;
+            } else {
+                final int oneHourSeconds = (int) TimeUnit.SECONDS.convert(1, TimeUnit.HOURS);
+                // AWS bills by the hour for EC2 Instances, so calculate the remaining seconds left in the "billing
+                // hour"
+                // Note: Since October 2017, this isn't true for Linux instances, but the logic hasn't yet been updated
+                // for this
+                final int freeSecondsLeft = oneHourSeconds
+                        - (int) (TimeUnit.SECONDS.convert(uptime, TimeUnit.MILLISECONDS) % oneHourSeconds);
+                // if we have less "free" (aka already paid for) time left than
+                // our idle time, stop/terminate the instance
+                // See JENKINS-23821
+                if (freeSecondsLeft <= TimeUnit.MINUTES.toSeconds(Math.abs(idleTerminationMinutes))
+                        && !itemsInQueueForThisSlave(computer)) {
+                    LOGGER.info("Idle timeout of " + computer.getName() + " after "
+                            + TimeUnit.MILLISECONDS.toMinutes(idleMilliseconds) + " idle minutes, with "
+                            + TimeUnit.SECONDS.toMinutes(freeSecondsLeft)
+                            + " minutes remaining in billing period");
+                    LOGGER.warning("Idle timeout of " + computer.getName() + " after "
+                            + TimeUnit.MILLISECONDS.toMinutes(idleMilliseconds) + " idle minutes, with "
+                            + TimeUnit.SECONDS.toMinutes(freeSecondsLeft)
+                            + " minutes remaining in billing period");
+                    EC2AbstractSlave slaveNode = computer.getNode();
+                    if (slaveNode != null) {
+                        LOGGER.warning("slave node not null 2");
+                        slaveNode.idleTimeout();
                     }
-                    long launchTimeout = node.getLaunchTimeoutInMillis();
-                    if (launchTimeout > 0 && uptime > launchTimeout) {
-                        LOGGER.warning("EC2RetentionStrategy: launch timeout expired: " + computer.getName());
-                        // Computer is offline and startup time has expired
-                        LOGGER.info("Startup timeout of " + computer.getName() + " after "
-                                + uptime + " milliseconds (timeout: "
-                                + launchTimeout + " milliseconds), instance status: " + state.toString());
-                        node.launchTimeout();
-                    }
-                    return CHECK_INTERVAL_MINUTES;
-                } else {
-                    LOGGER.log(
-                            Level.FINE,
-                            "Computer {0} offline but not connecting, will check if it should be terminated because of the idle time configured",
-                            computer.getInstanceId());
                 }
             }
         }
-        LOGGER.warning("exiting internal check");
+
+        // on rare occasions, AWS may return fault instance which shows running in AWS console but can not be
+        // connected.
+        // need terminate such fault instance.
+        // An instance may also fail running user data scripts and
+        // need to be cleaned up.
+        if (computer.isOffline()) {
+            LOGGER.warning("computer is offline");
+            if (computer.isConnecting()) {
+                LOGGER.log(
+                        Level.FINE,
+                        "Computer {0} connecting and still offline, will check if the launch timeout has expired",
+                        computer.getInstanceId());
+                LOGGER.warning(computer.getInstanceId() + " is connecting and still offline, will check if the launch timeout has expired");
+
+                EC2AbstractSlave node = computer.getNode();
+                if (Objects.isNull(node)) {
+                    LOGGER.warning("Node is null");
+                    return CHECK_INTERVAL_MINUTES;
+                }
+                long launchTimeout = node.getLaunchTimeoutInMillis();
+                if (launchTimeout > 0 && uptime > launchTimeout) {
+                    // Computer is offline and startup time has expired
+                    LOGGER.info("Startup timeout of " + computer.getName() + " after "
+                            + uptime + " milliseconds (timeout: "
+                            + launchTimeout + " milliseconds), instance status: " + state.toString());
+                    LOGGER.warning("Startup timeout of " + computer.getName() + " after "
+                            + uptime + " milliseconds (timeout: "
+                            + launchTimeout + " milliseconds), instance status: " + state.toString());
+                    node.launchTimeout();
+                }
+                return CHECK_INTERVAL_MINUTES;
+            } else {
+                LOGGER.log(
+                        Level.FINE,
+                        "Computer {0} offline but not connecting, will check if it should be terminated because of the idle time configured",
+                        computer.getInstanceId());
+                LOGGER.warning("Computer " + computer.getInstanceId() + " offline but not connecting, will check if it should be terminated because of the idle time configured");
+                // TODO: reconnection code needs to live here
+            }
+        }
+
         return CHECK_INTERVAL_MINUTES;
     }
 
